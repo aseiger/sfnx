@@ -336,6 +336,7 @@ card of another arch than the build's (`src/card_check.hpp`).
 | Cancel, and K/V pool pressure on a 32k context (`serve/sfnx-pool.json`, arena on: 6 × 9k conversations, then 3 × 7k with 4,500-token copies). Prints the engine's paused / resumed / pool-full lines and asserts nothing itself — read the printout | `serve/cancel_pool_check.sh` |
 | The arena: logits against every expert in VRAM, nothing lent and lending; batched = alone while lending | `tools/arena_check.sh` |
 | Six ~160k-token conversations decoding at once | `serve/arena_long_check.sh` |
+| The pool from free VRAM with the arena off (`FNX_KV_RESERVE_MIB`, `FNX_KV_PAGES`): both guards refuse their bad values, logits byte for byte against the base, and 3 × 160k running the context-sized pool short where 4 × 160k fits in the free VRAM | `serve/pool_vram_check.sh` |
 | Draft layer after batched windows in freshly lent pages (guards a NaN the draft layer met there) | `serve/gap_check.sh serve/sfnx-gap.json "plain="` |
 | Batched windows = alone, with and without drafts (every token up to each reference's end) | `bin/batch_test`, `tools/lab.sh batch` |
 | Batched drafts' sampler against plain sampling, in distribution (3 lanes, open1, 600 seeds: every p ≥ 0.34) | `SAMPLE_TEST_LANES=3 bin/sample_test` |
