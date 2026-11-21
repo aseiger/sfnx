@@ -81,8 +81,7 @@ __global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl,
 Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // the 27B build's settings: this Flash-Next engine has none of what they set, so one given is a mistake, not a
     // run of the default
-    for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_PF_WINDOWS", "FNX_PF_SCORES",
-                          "FNX_KV_PAGES", "FNX_KV_RESERVE_MIB"})
+    for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_PF_WINDOWS", "FNX_PF_SCORES"})
         if (std::getenv(k)) throw std::runtime_error(std::string(k) + " is the 27B's: Flash-Next has nothing it sets");
     if (!m.ple_rows) throw std::runtime_error("Engine: the model has no n-gram rows (a Load::HOLD model runs no engine)");
     if (ngram_late()) {   // as the engine is made, so a box that cannot map them refuses at start, not at a first token
@@ -294,6 +293,12 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // workspaces and the lanes' page tables. Default 512: they took ~270 MiB a card on three cards and ~340 on two,
     // through one to six lanes, batched drafts and a 114k prompt
     if (m.arena) {
+        // the arena sizes its own region and lends expert slots into it; the pool's own knobs below are for a box
+        // running without one, where nothing is lent and free VRAM would otherwise go unused
+        for (const char* k : {"FNX_KV_PAGES", "FNX_KV_RESERVE_MIB"})
+            if (std::getenv(k))
+                throw std::runtime_error(std::string(k) + " is the arena-off pool's: with FNX_ARENA=1 the arena sizes it "
+                                     "(FNX_ARENA_BASE_PAGES, FNX_ARENA_RESERVE_MIB)");
         const long long reserve_mib = env_int("FNX_ARENA_RESERVE_MIB", 512);
         if (reserve_mib < 0) throw std::runtime_error("FNX_ARENA_RESERVE_MIB: want MiB >= 0, got " + std::to_string(reserve_mib));
         const size_t reserve = (size_t) reserve_mib << 20;
@@ -358,7 +363,50 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             arena_cap_ = std::min(arena_cap_, n_pages + (int) (room / page));
         }
     } else {
+        // No arena: the pool need not stop at one context. FNX_KV_RESERVE_MIB (the 27B engine's knob, which this build
+        // used to refuse) sizes it from what every card has free after the experts, the buffers above and the prompt
+        // path's stages, keeping that many MiB for what comes later: the window graphs captured at first use, cuBLAS's
+        // workspaces and the lanes' page tables - ~270 MiB a card on three cards and ~340 on two, through one to six
+        // lanes with batched drafts and a 114k prompt. FNX_KV_PAGES pins a count instead of taking everything. With
+        // neither, the pool is the context's pages plus the extra lanes' blocks, exactly as before. A bigger pool means
+        // more conversations at once, not longer ones: --max-context still caps one request, and the admission and
+        // parking logic already works off free pages (sfnx.cpp), so nothing else has to know.
+        const bool grow = std::getenv("FNX_KV_RESERVE_MIB") || std::getenv("FNX_KV_PAGES");
+        const long long reserve_mib = env_int("FNX_KV_RESERVE_MIB", 1024);
+        if (reserve_mib < 0) throw std::runtime_error("FNX_KV_RESERVE_MIB: want MiB >= 0, got " + std::to_string(reserve_mib));
+        int room = n_pages;   // the least any card holds beside the reserve and the two stages prefill_stages() adds
+        if (grow) {
+            const size_t reserve = (size_t) reserve_mib << 20;
+            room = INT32_MAX;
+            for (int c = 0; c < NCARD; ++c) {
+                ck(cudaSetDevice(m.cards[c].dev), "cudaSetDevice");
+                size_t fr = 0, tot = 0;
+                ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
+                const size_t page = kvp_page(c) * sizeof(uint16_t), mine = reserve + 2 * pf_stage_bytes(c);
+                const int fit = fr > mine ? (int) ((fr - mine) / page) : 0;
+                if (fit < n_pages)
+                    throw std::runtime_error("card " + std::to_string(c) + " has " + std::to_string(fr >> 20) + " MiB free: " +
+                                             std::to_string(n_pages) + " K/V pages (" + std::to_string(max_ctx) + " positions and " +
+                                             std::to_string(std::max(lanes, 1) - 1) + " more lanes' states) plus " +
+                                             std::to_string(reserve_mib) + " MiB in reserve (FNX_KV_RESERVE_MIB) do not fit");
+                room = std::min(room, fit);
+            }
+        }
         prefill_stages();
+        if (std::getenv("FNX_KV_PAGES")) {
+            const long long want = env_int("FNX_KV_PAGES", 0);
+            if (want < n_pages || want > room)
+                throw std::runtime_error("FNX_KV_PAGES: want " + std::to_string(n_pages) + " (the context and the lanes) to " +
+                                         std::to_string(room) + " (what every card holds with " + std::to_string(reserve_mib) +
+                                         " MiB kept)");
+            n_pages = (int) want;
+        } else if (grow) {
+            n_pages = room;
+        }
+        if (grow && n_pages > ctx_pages + extra_pages)
+            std::fprintf(stderr, "fnx: K/V pool from free VRAM: %d pages (%d positions); the context and the lanes need %d, "
+                                 "%d fit with %lld MiB a card kept (FNX_KV_RESERVE_MIB)\n",
+                         n_pages, n_pages * KVP_POS, ctx_pages + extra_pages, room, reserve_mib);
     }
     for (int c = 0; c < NCARD; ++c) {
         CardBuf* b = cb_[c];

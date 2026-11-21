@@ -1,8 +1,10 @@
 # Memory: the K/V arena and experts in RAM
 
-Two problems with the same parts. Six conversations at 262,144 tokens need 1.57M positions of K/V, and the pool that
-fits beside every expert holds ~450k (int8). And a Q8_0 build's routed experts do not fit in VRAM at all. Both are
-solved by letting weights and K/V trade places, one expert slot at a time.
+Two problems with the same parts. Six conversations at 262,144 tokens need 1.57M positions of K/V, and a pool sized
+from `--max-context` — what the arena-off engine gives, 1.714 × the context in int8 pages — holds ~450k. And a Q8_0
+build's routed experts do not fit in VRAM at all. Both are solved by letting weights and K/V trade places, one expert
+slot at a time; the first is also solved without trading anything, by sizing the pool from the cards' free VRAM
+([`FNX_KV_RESERVE_MIB`](config.md)), which on four cards reaches 1.51M positions with every expert still resident.
 
 ## The arena
 
@@ -42,6 +44,27 @@ The arena is on unless something turns it off: `serve/sfnx.json` sets nothing fo
 The arena's own limits: a prompt read with experts lent reads those in place from RAM — the prompt path's stages are
 sized from the experts out of a slot at load, and none are out with the arena — not measured yet. And requests read one
 at a time without decoding (one token each) all land on the same lane, so each parks the one before: ~1 s each.
+
+## Without an arena: the pool from free VRAM
+
+With `FNX_ARENA=0` nothing is lent, so until now the pool was whatever `--max-context` implies — 1.714 contexts, because
+int8 pages cost that much less than f16 ones — however much VRAM the experts left. `FNX_KV_RESERVE_MIB` (the 27B
+engine's knob, now read by both) sizes it instead from what every card has free after the weights, the decode and prompt
+buffers and the prompt path's stages, less that reserve; `FNX_KV_PAGES` pins a count. A bigger pool means more
+conversations at once, never longer ones: `--max-context` still caps one request, and admission already works off free
+pages.
+
+Measured on four cards with every expert in VRAM and the reserve at 1024 MiB: 8,099 pages / 1,555,008 positions, against
+the 2,343 / 449,856 the context gives. `exact` is byte for byte identical to the same build without it — only how many
+pages exist changed, not what happens in one — and `batch` still gives every lane its tokens alone. Four conversations of
+156k tokens each (624,698 positions) then decoded together with no shortage line at all; three of them (468,634) against
+the context-sized pool ran it short and parked one conversation to host memory in 1.18 s. `serve/pool_vram_check.sh`
+repeats both halves.
+
+What it does not do is lend: with the arena off that VRAM is K/V or nothing, so this only spends what would otherwise
+sit idle. Beyond it — six conversations at full length on three cards, say — still needs the arena, and the arena needs
+host copies of the experts. The pool left 2.1 GiB a card free (786 MiB on the card holding vision), which is what the
+window graphs and cuBLAS grow into: raise the reserve before raising `--batch`.
 
 ## Q8_0
 

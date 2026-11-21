@@ -33,5 +33,5 @@ for i in 1 2 3 4 5; do
 done
 kill $smi
 tail -c +$((from + 1)) "$L" | grep -E "^sfnx: slot [0-9]+: prompt" | sed 's/^sfnx: //'
-awk -F', ' '{u[$1] += $2; w[$1] += $3; n[$1]++} END {s = "GPUs:"; for (c = 0; c < 3; c++) if (n[c]) s = s sprintf(" %d: %.0f%% %.0f W", c, u[c] / n[c], w[c] / n[c]); print s}' "$gpu"
+awk -F', ' -v nc="$(cat "$F/build/ncard" 2>/dev/null || echo 3)" '{u[$1] += $2; w[$1] += $3; n[$1]++} END {s = "GPUs:"; for (c = 0; c < nc; c++) if (n[c]) s = s sprintf(" %d: %.0f%% %.0f W", c, u[c] / n[c], w[c] / n[c]); print s}' "$gpu"
 rm -f "$gpu"
